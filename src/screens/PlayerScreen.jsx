@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Play, Pause, ChevronLeft, Music, Sliders } from 'lucide-react';
-import { useStore } from '../store';
+import { Play, Pause, ChevronLeft, Music, Sliders, Mic, Volume2 } from 'lucide-react';
+import { useStore } from '../store'; // Zustand store
 import { binauralEngine } from '../BinauralBeatEngine';
 import InteractionOverlay from '../components/InteractionOverlay';
 
@@ -23,15 +23,18 @@ const hypnoticPrompts = [
 ];
 
 const PlayerScreen = ({ sessionId, onBack }) => {
-  const { sessions, selectedVoiceURI } = useStore();
+  const { sessions, selectedVoiceURI, setSelectedVoiceURI } = useStore();
   const session = sessions.find(s => s.id === sessionId);
 
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentModuleIndex, setCurrentModuleIndex] = useState(-1);
   const [currentText, setCurrentText] = useState("准备就绪");
+  
+  // 音频设置
   const [rate, setRate] = useState(0.9);
   const [pitch, setPitch] = useState(1.0);
   const [showSettings, setShowSettings] = useState(false);
+  const [availableVoices, setAvailableVoices] = useState([]); // [新增] 当前可用的声音列表
   
   // 互动状态
   const [interactionMode, setInteractionMode] = useState(true);
@@ -45,19 +48,40 @@ const PlayerScreen = ({ sessionId, onBack }) => {
   const userResponseResolver = useRef(null);
   const wakeUpTimeoutRef = useRef(null); 
 
+  // [新增] 加载声音列表
+  useEffect(() => {
+      const loadVoices = () => {
+          setAvailableVoices(window.speechSynthesis.getVoices());
+      };
+      loadVoices();
+      window.speechSynthesis.onvoiceschanged = loadVoices;
+      return () => { window.speechSynthesis.onvoiceschanged = null; };
+  }, []);
+
   if (!session) { onBack(); return null; }
 
+  // [核心修改] 这里的 speak 函数现在会直接读取 Store 里的最新设置
+  // 即使在循环中调用，也能获取到最新的 selectedVoiceURI
   const speak = (text, forceRate = null, forcePitch = null) => {
     return new Promise((resolve) => {
       if (stopSignal.current) { resolve(); return; }
       window.speechSynthesis.cancel();
+      
       const u = new SpeechSynthesisUtterance(text);
-      if (selectedVoiceURI) {
+      
+      // 实时获取当前选中的声音 ID (解决闭包过时问题)
+      // 我们直接使用 useStore.getState() 来确保获取的是这一刻最新的值
+      const currentVoiceURI = useStore.getState().selectedVoiceURI;
+      
+      if (currentVoiceURI) {
           const voices = window.speechSynthesis.getVoices();
-          const targetVoice = voices.find(v => v.voiceURI === selectedVoiceURI);
+          const targetVoice = voices.find(v => v.voiceURI === currentVoiceURI);
           if (targetVoice) u.voice = targetVoice;
       }
-      if (!u.voice && !selectedVoiceURI) u.lang = 'zh-CN'; 
+      
+      // 兜底策略
+      if (!u.voice) u.lang = 'zh-CN'; 
+
       u.rate = forceRate || rate; 
       u.pitch = forcePitch || pitch;
       u.onend = resolve; 
@@ -68,7 +92,6 @@ const PlayerScreen = ({ sessionId, onBack }) => {
 
   const wait = (ms) => new Promise(r => setTimeout(r, ms));
 
-  // [修改] 简化后的结束交互逻辑（移除了语音清理）
   const finishInteraction = (result) => {
       if (wakeUpTimeoutRef.current) {
           clearTimeout(wakeUpTimeoutRef.current);
@@ -83,14 +106,12 @@ const PlayerScreen = ({ sessionId, onBack }) => {
   const handleScreenTap = () => {
       if (!isInteracting) return;
       
-      // 唤醒模式：任意点击通过
       if (isWakingUp) {
           if (navigator.vibrate) navigator.vibrate([100, 50, 100]); 
           finishInteraction('POSITIVE');
           return;
       }
 
-      // 正常模式：计数点击
       if (navigator.vibrate) navigator.vibrate(30); 
       const newCount = userTaps + 1;
       setUserTaps(newCount);
@@ -101,7 +122,6 @@ const PlayerScreen = ({ sessionId, onBack }) => {
       }
   };
 
-  // 循环叫醒逻辑
   const startWakeUpLoop = async () => {
       console.log("进入唤醒循环");
       setIsWakingUp(true); 
@@ -109,14 +129,8 @@ const PlayerScreen = ({ sessionId, onBack }) => {
       
       const alertUser = async () => {
           if (!userResponseResolver.current) return;
-
-          // 强力震动
           if (navigator.vibrate) navigator.vibrate([500, 200, 500, 200, 1000]);
-          
-          // 语音喊话
           await speak("喂！醒醒！... 如果你听到了，请点击屏幕。", 1.3, 1.2);
-
-          // 15秒后再次循环
           if (userResponseResolver.current) {
               wakeUpTimeoutRef.current = setTimeout(alertUser, 15000);
           }
@@ -124,7 +138,6 @@ const PlayerScreen = ({ sessionId, onBack }) => {
       await alertUser();
   };
 
-  // 核心互动流程 (移除了 startListening)
   const performInteractiveCheck = async () => {
       binauralEngine.stop();
       setIsInteracting(true);
@@ -143,20 +156,15 @@ const PlayerScreen = ({ sessionId, onBack }) => {
       setInteractionStatus(`请点击屏幕 ${randomCount} 次...`);
       await speak(script.action(randomCount), rate, pitch);
       
-      // [修改] 不再启动语音识别，单纯等待用户点击
-      // Promise 会一直挂起，直到 handleScreenTap 调用 finishInteraction
       const interactionPromise = new Promise(resolve => {
           userResponseResolver.current = resolve;
       });
 
-      // 15秒无操作则叫醒
       wakeUpTimeoutRef.current = setTimeout(() => {
           startWakeUpLoop();
       }, 15000);
 
       const result = await interactionPromise;
-      
-      // 确保清理定时器
       if (wakeUpTimeoutRef.current) clearTimeout(wakeUpTimeoutRef.current);
 
       if (result === 'POSITIVE' && !isWakingUp) {
@@ -170,8 +178,6 @@ const PlayerScreen = ({ sessionId, onBack }) => {
       setTargetTaps(0);
       binauralEngine.start();
       
-      // 只有叫醒循环失败(理论上不会，因为必须点击才能退出)才会NEGATIVE
-      // 这里保留逻辑以防扩展
       if (result === 'NEGATIVE') {
           return 'REPEAT';
       } else {
@@ -261,11 +267,41 @@ const PlayerScreen = ({ sessionId, onBack }) => {
         <button onClick={() => setShowSettings(!showSettings)} className={`p-2 rounded-full transition-colors ${showSettings ? 'bg-appleBlue text-white' : 'text-textBlack hover:bg-gray-200'}`}><Sliders size={24} /></button>
       </div>
 
+      {/* 升级版设置面板 */}
       {showSettings && (
-          <div className="absolute top-16 right-4 left-4 z-20 bg-white/90 backdrop-blur-md p-5 rounded-2xl shadow-xl border border-gray-100 animate-in slide-in-from-top-2 duration-200">
-              <div className="space-y-5">
-                  <div><div className="flex justify-between text-sm font-bold text-gray-500 mb-2"><span>语速</span><span className="text-appleBlue">{rate.toFixed(1)}x</span></div><input type="range" min="0.5" max="2.0" step="0.1" value={rate} onChange={(e) => setRate(parseFloat(e.target.value))} className="w-full accent-appleBlue h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer"/></div>
-                  <div><div className="flex justify-between text-sm font-bold text-gray-500 mb-2"><span>音调</span><span className="text-appleBlue">{pitch.toFixed(1)}</span></div><input type="range" min="0.5" max="1.5" step="0.1" value={pitch} onChange={(e) => setPitch(parseFloat(e.target.value))} className="w-full accent-appleBlue h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer"/></div>
+          <div className="absolute top-16 right-4 left-4 z-20 bg-white/95 backdrop-blur-md p-5 rounded-2xl shadow-xl border border-gray-100 animate-in slide-in-from-top-2 duration-200 max-h-[70vh] overflow-y-auto">
+              <div className="space-y-6">
+                  {/* 发音人选择 */}
+                  <div>
+                      <div className="flex justify-between text-sm font-bold text-gray-500 mb-2">
+                          <span className="flex items-center gap-2"><Volume2 size={16}/> 发音人 (TTS)</span>
+                      </div>
+                      <select 
+                          className="w-full p-3 bg-gray-100 rounded-lg border-none outline-none text-sm font-medium"
+                          value={selectedVoiceURI || ""}
+                          onChange={(e) => setSelectedVoiceURI(e.target.value)}
+                      >
+                          <option value="">-- 系统默认 --</option>
+                          {availableVoices.map((voice) => (
+                              <option key={voice.voiceURI} value={voice.voiceURI}>
+                                  {voice.name}
+                              </option>
+                          ))}
+                      </select>
+                      <p className="text-[10px] text-gray-400 mt-1">切换后将在下一句生效</p>
+                  </div>
+
+                  <hr className="border-gray-100"/>
+
+                  {/* 语速音调 */}
+                  <div>
+                      <div className="flex justify-between text-sm font-bold text-gray-500 mb-2"><span>语速</span><span className="text-appleBlue">{rate.toFixed(1)}x</span></div>
+                      <input type="range" min="0.5" max="2.0" step="0.1" value={rate} onChange={(e) => setRate(parseFloat(e.target.value))} className="w-full accent-appleBlue h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer"/>
+                  </div>
+                  <div>
+                      <div className="flex justify-between text-sm font-bold text-gray-500 mb-2"><span>音调</span><span className="text-appleBlue">{pitch.toFixed(1)}</span></div>
+                      <input type="range" min="0.5" max="1.5" step="0.1" value={pitch} onChange={(e) => setPitch(parseFloat(e.target.value))} className="w-full accent-appleBlue h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer"/>
+                  </div>
               </div>
           </div>
       )}
