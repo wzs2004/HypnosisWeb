@@ -8,45 +8,47 @@ class BinauralBeatEngine {
   }
 
   init() {
-    // 浏览器音频上下文初始化
+    // 兼容 iOS Safari 的 AudioContext 写法
+    const AudioContext = window.AudioContext || window.webkitAudioContext;
+    
     if (!this.audioContext) {
-      const AudioContext = window.AudioContext || window.webkitAudioContext;
       this.audioContext = new AudioContext();
       this.gainNode = this.audioContext.createGain();
-      this.gainNode.gain.value = 0.05; // 音量设为 5%，避免刺耳
+      this.gainNode.gain.value = 0.05; // 5% 音量
       this.gainNode.connect(this.audioContext.destination);
-    }
-    // 解决浏览器自动静音策略
-    if (this.audioContext.state === 'suspended') {
-      this.audioContext.resume();
     }
   }
 
-  start() {
+  async start() {
     if (this.isPlaying) return;
     this.init();
 
-    // 左耳声道：100Hz
+    // [关键修改] iOS 强制唤醒 AudioContext
+    // iOS Safari 如果处于 suspended 状态，必须在用户点击事件中 resume
+    if (this.audioContext.state === 'suspended') {
+        await this.audioContext.resume();
+    }
+
+    // 左耳 100Hz
     this.leftOsc = this.audioContext.createOscillator();
     this.leftOsc.type = 'sine';
-    this.leftOsc.frequency.value = 200;
+    this.leftOsc.frequency.value = 100;
     
     const leftPanner = this.audioContext.createStereoPanner();
-    leftPanner.pan.value = -1; // 完全左声道
+    leftPanner.pan.value = -1;
 
-    // 右耳声道：105Hz (产生 5Hz Theta 波)
+    // 右耳 105Hz (Theta 5Hz)
     this.rightOsc = this.audioContext.createOscillator();
     this.rightOsc.type = 'sine';
-    this.rightOsc.frequency.value = 205;
+    this.rightOsc.frequency.value = 105;
 
     const rightPanner = this.audioContext.createStereoPanner();
-    rightPanner.pan.value = 1; // 完全右声道
+    rightPanner.pan.value = 1;
 
-    // 连接节点图
     this.leftOsc.connect(leftPanner).connect(this.gainNode);
     this.rightOsc.connect(rightPanner).connect(this.gainNode);
 
-    // 开始播放
+    // iOS 保护：延迟极短时间启动，防止主线程冲突
     this.leftOsc.start();
     this.rightOsc.start();
     this.isPlaying = true;
@@ -56,18 +58,20 @@ class BinauralBeatEngine {
     if (!this.isPlaying) return;
     
     try {
-      // 音量平滑淡出，防止“噗”的一声
       const currTime = this.audioContext.currentTime;
+      // 0.1秒淡出，避免噗噗声
       this.gainNode.gain.linearRampToValueAtTime(0, currTime + 0.1);
 
       setTimeout(() => {
           if(this.leftOsc) { this.leftOsc.stop(); try{this.leftOsc.disconnect()}catch(e){} }
           if(this.rightOsc) { this.rightOsc.stop(); try{this.rightOsc.disconnect()}catch(e){} }
-          this.gainNode.gain.value = 0.05; // 恢复音量以便下次播放
+          
+          // 重置音量供下次使用
+          this.gainNode.gain.value = 0.05; 
           this.isPlaying = false;
       }, 100);
     } catch(e) {
-      console.error("停止音频出错:", e);
+      console.error(e);
       this.isPlaying = false;
     }
   }
