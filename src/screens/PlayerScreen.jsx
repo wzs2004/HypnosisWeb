@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Play, Pause, ChevronLeft, Music, Sliders, Mic, Volume2 } from 'lucide-react';
-import { useStore } from '../store'; // Zustand store
+import { useStore } from '../store';
 import { binauralEngine } from '../BinauralBeatEngine';
 import InteractionOverlay from '../components/InteractionOverlay';
 
@@ -30,13 +30,11 @@ const PlayerScreen = ({ sessionId, onBack }) => {
   const [currentModuleIndex, setCurrentModuleIndex] = useState(-1);
   const [currentText, setCurrentText] = useState("准备就绪");
   
-  // 音频设置
   const [rate, setRate] = useState(0.9);
   const [pitch, setPitch] = useState(1.0);
   const [showSettings, setShowSettings] = useState(false);
-  const [availableVoices, setAvailableVoices] = useState([]); // [新增] 当前可用的声音列表
+  const [availableVoices, setAvailableVoices] = useState([]);
   
-  // 互动状态
   const [interactionMode, setInteractionMode] = useState(true);
   const [isInteracting, setIsInteracting] = useState(false);
   const [interactionStatus, setInteractionStatus] = useState("");
@@ -48,10 +46,10 @@ const PlayerScreen = ({ sessionId, onBack }) => {
   const userResponseResolver = useRef(null);
   const wakeUpTimeoutRef = useRef(null); 
 
-  // [新增] 加载声音列表
   useEffect(() => {
       const loadVoices = () => {
-          setAvailableVoices(window.speechSynthesis.getVoices());
+          const voices = window.speechSynthesis.getVoices();
+          setAvailableVoices(voices);
       };
       loadVoices();
       window.speechSynthesis.onvoiceschanged = loadVoices;
@@ -60,32 +58,35 @@ const PlayerScreen = ({ sessionId, onBack }) => {
 
   if (!session) { onBack(); return null; }
 
-  // [核心修改] 这里的 speak 函数现在会直接读取 Store 里的最新设置
-  // 即使在循环中调用，也能获取到最新的 selectedVoiceURI
   const speak = (text, forceRate = null, forcePitch = null) => {
     return new Promise((resolve) => {
       if (stopSignal.current) { resolve(); return; }
+      // 注意：这里不要盲目 cancel，否则可能会打断刚解锁的音频流，
+      // 但为了防止重叠，我们只在非iOS或确定有播放时cancel，或者直接依靠 speak 队列
       window.speechSynthesis.cancel();
       
       const u = new SpeechSynthesisUtterance(text);
-      
-      // 实时获取当前选中的声音 ID (解决闭包过时问题)
-      // 我们直接使用 useStore.getState() 来确保获取的是这一刻最新的值
       const currentVoiceURI = useStore.getState().selectedVoiceURI;
       
       if (currentVoiceURI) {
           const voices = window.speechSynthesis.getVoices();
           const targetVoice = voices.find(v => v.voiceURI === currentVoiceURI);
-          if (targetVoice) u.voice = targetVoice;
+          if (targetVoice) {
+              u.voice = targetVoice;
+              u.lang = targetVoice.lang; 
+          }
       }
       
-      // 兜底策略
       if (!u.voice) u.lang = 'zh-CN'; 
 
       u.rate = forceRate || rate; 
       u.pitch = forcePitch || pitch;
       u.onend = resolve; 
-      u.onerror = resolve; 
+      u.onerror = (e) => {
+          // iOS 有时会因为音频会话被抢占而报错，这里做容错处理
+          console.error("TTS Error:", e);
+          resolve();
+      }; 
       window.speechSynthesis.speak(u);
     });
   };
@@ -105,17 +106,14 @@ const PlayerScreen = ({ sessionId, onBack }) => {
 
   const handleScreenTap = () => {
       if (!isInteracting) return;
-      
       if (isWakingUp) {
           if (navigator.vibrate) navigator.vibrate([100, 50, 100]); 
           finishInteraction('POSITIVE');
           return;
       }
-
       if (navigator.vibrate) navigator.vibrate(30); 
       const newCount = userTaps + 1;
       setUserTaps(newCount);
-      
       if (targetTaps > 0 && newCount === targetTaps) {
           if (navigator.vibrate) navigator.vibrate([30, 50, 30]); 
           setTimeout(() => finishInteraction('POSITIVE'), 600);
@@ -123,10 +121,8 @@ const PlayerScreen = ({ sessionId, onBack }) => {
   };
 
   const startWakeUpLoop = async () => {
-      console.log("进入唤醒循环");
       setIsWakingUp(true); 
       setInteractionStatus("请点击屏幕以继续...");
-      
       const alertUser = async () => {
           if (!userResponseResolver.current) return;
           if (navigator.vibrate) navigator.vibrate([500, 200, 500, 200, 1000]);
@@ -149,20 +145,13 @@ const PlayerScreen = ({ sessionId, onBack }) => {
       const script = hypnoticPrompts[Math.floor(Math.random() * hypnoticPrompts.length)];
 
       setInteractionStatus("保持闭眼，听从引导...");
-      
       await speak(script.intro, rate * 0.9, pitch * 0.95);
       await wait(500);
-      
       setInteractionStatus(`请点击屏幕 ${randomCount} 次...`);
       await speak(script.action(randomCount), rate, pitch);
       
-      const interactionPromise = new Promise(resolve => {
-          userResponseResolver.current = resolve;
-      });
-
-      wakeUpTimeoutRef.current = setTimeout(() => {
-          startWakeUpLoop();
-      }, 15000);
+      const interactionPromise = new Promise(resolve => { userResponseResolver.current = resolve; });
+      wakeUpTimeoutRef.current = setTimeout(() => { startWakeUpLoop(); }, 15000);
 
       const result = await interactionPromise;
       if (wakeUpTimeoutRef.current) clearTimeout(wakeUpTimeoutRef.current);
@@ -178,11 +167,20 @@ const PlayerScreen = ({ sessionId, onBack }) => {
       setTargetTaps(0);
       binauralEngine.start();
       
-      if (result === 'NEGATIVE') {
-          return 'REPEAT';
-      } else {
-          return 'NEXT';
-      }
+      if (result === 'NEGATIVE') return 'REPEAT';
+      else return 'NEXT';
+  };
+
+  // [重要] iOS 强制解锁音频引擎
+  const unlockIOSAudio = () => {
+      // 1. 播放一个极短的静音 TTS
+      const silentUtterance = new SpeechSynthesisUtterance(" ");
+      silentUtterance.volume = 0; // 静音
+      silentUtterance.rate = 10;  // 极快
+      window.speechSynthesis.speak(silentUtterance);
+
+      // 2. 确保 BinauralEngine 也被 resume
+      binauralEngine.start(); 
   };
 
   const togglePlay = async () => {
@@ -199,9 +197,12 @@ const PlayerScreen = ({ sessionId, onBack }) => {
         return;
     }
 
+    // [关键点] 在用户点击的一瞬间，强制解锁 iOS 音频限制
+    unlockIOSAudio();
+
     stopSignal.current = false;
     setIsPlaying(true);
-    binauralEngine.start();
+    
     try { if (navigator.wakeLock) await navigator.wakeLock.request('screen'); } catch(e){}
 
     for (let i = 0; i < session.modules.length; i++) {
@@ -267,11 +268,9 @@ const PlayerScreen = ({ sessionId, onBack }) => {
         <button onClick={() => setShowSettings(!showSettings)} className={`p-2 rounded-full transition-colors ${showSettings ? 'bg-appleBlue text-white' : 'text-textBlack hover:bg-gray-200'}`}><Sliders size={24} /></button>
       </div>
 
-      {/* 升级版设置面板 */}
       {showSettings && (
           <div className="absolute top-16 right-4 left-4 z-20 bg-white/95 backdrop-blur-md p-5 rounded-2xl shadow-xl border border-gray-100 animate-in slide-in-from-top-2 duration-200 max-h-[70vh] overflow-y-auto">
               <div className="space-y-6">
-                  {/* 发音人选择 */}
                   <div>
                       <div className="flex justify-between text-sm font-bold text-gray-500 mb-2">
                           <span className="flex items-center gap-2"><Volume2 size={16}/> 发音人 (TTS)</span>
@@ -290,10 +289,7 @@ const PlayerScreen = ({ sessionId, onBack }) => {
                       </select>
                       <p className="text-[10px] text-gray-400 mt-1">切换后将在下一句生效</p>
                   </div>
-
                   <hr className="border-gray-100"/>
-
-                  {/* 语速音调 */}
                   <div>
                       <div className="flex justify-between text-sm font-bold text-gray-500 mb-2"><span>语速</span><span className="text-appleBlue">{rate.toFixed(1)}x</span></div>
                       <input type="range" min="0.5" max="2.0" step="0.1" value={rate} onChange={(e) => setRate(parseFloat(e.target.value))} className="w-full accent-appleBlue h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer"/>
